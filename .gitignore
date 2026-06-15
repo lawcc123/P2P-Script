@@ -1,0 +1,9 @@
+p2p_private_config.json
+browser_session/
+Output Excel File/
+__pycache__/
+build/
+dist/
+release/
+*.xlsx
+*.xlsm

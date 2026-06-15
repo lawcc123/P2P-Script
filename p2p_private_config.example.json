@@ -1,0 +1,7 @@
+{
+  "login_url": "https://YOUR-TENANT.yardione.com/Account/Login",
+  "api_base": "https://YOUR-TENANT.elevate.cafe/procuretopaynet/api/connect",
+  "database": "YOUR_DATABASE",
+  "origin": "https://YOUR-TENANT.elevate.cafe",
+  "referer": "https://YOUR-TENANT.elevate.cafe/procuretopaynet/content/"
+}
