@@ -26,6 +26,7 @@ Run:  python P2P_Registry_Sync.py
 import json
 import sys
 import os
+import re
 import shutil
 import time
 import base64
@@ -82,8 +83,6 @@ PO_MILESTONE_URL = f"{API_BASE}/po/milestones"
 POGRID_URL       = f"{API_BASE}/po/charts/data"
 BULK_IRGRID_RECORD_LIMIT = 1000
 BULK_PO_RECORD_LIMIT = 1000
-STATUS_MODE = "detailed"  # detailed, hybrid, or fast
-VALID_STATUS_MODES = ("detailed", "hybrid", "fast")
 
 # Header names in the registry — used to find columns dynamically
 H_CH_DATE   = "Ch. Date (DD/MM/YYYY)"
@@ -98,8 +97,12 @@ IRGRID_IR_FIELDS = ("Inv_hmy", "IR_hmy", "IR", "InvoiceNumber")
 IRGRID_PO_FIELDS = ("PO_hmy", "PO", "PONumber", "POId")
 IRGRID_STATUS_FIELDS = ("Status", "workflowStepName", "WorkflowStatus")
 
-POGRID_PO_FIELDS = ("PO", "POCode", "PONumber", "PONum", "PONo")
-POGRID_STATUS_FIELDS = ("WorkflowStatus", "Status", "POStatus")
+POGRID_PO_FIELDS = (
+    "PO", "POCode", "PONumber", "PONum", "PONo", "PO_hmy", "POId",
+)
+POGRID_DESCRIPTION_FIELDS = (
+    "PODesc", "Description", "PODescription", "PoDescription", "Desc", "Notes",
+)
 MILESTONE_DATE_FIELDS = (
     "RevisedDate", "DtCompleted", "Date", "CompletedDate", "DateCompleted",
     "DtComplete", "DtCompletion", "CompletionDate", "ActualDate",
@@ -126,26 +129,6 @@ def get_registry_path():
     print(f"Press Enter without a file to use: {os.path.basename(DEFAULT_REGISTRY_PATH)}")
     selected = clean_dropped_path(input("Excel file: "))
     return selected or DEFAULT_REGISTRY_PATH
-
-
-def get_status_mode():
-    """
-    Let the user override STATUS_MODE at runtime.
-    Pressing Enter keeps the default detailed mode.
-    """
-    print("\nP2P status mode:")
-    print("  detailed = exact workflow milestone status (default)")
-    print("  hybrid   = fewer IR milestone calls, detailed PO milestones")
-    print("  fast     = bulk status only, fastest but less detailed")
-
-    selected = input(f"Mode [{STATUS_MODE}]: ").strip().lower()
-    if not selected:
-        return STATUS_MODE
-    if selected in VALID_STATUS_MODES:
-        return selected
-
-    print(f"Unknown mode '{selected}' - using default: {STATUS_MODE}")
-    return STATUS_MODE
 
 
 def get_backup_path(registry_path):
@@ -361,7 +344,7 @@ def _unwrap_grid_records(raw):
 
 
 def preload_pogrid(page, headers):
-    """Pull the PO grid once so PO-only rows can use local status data."""
+    """Pull the PO grid once for local PO-number and description lookup."""
     print("\nPreloading PO records for local lookup...")
     resp = page.request.post(
         POGRID_URL,
@@ -375,7 +358,7 @@ def preload_pogrid(page, headers):
         headers=headers,
     )
     records = _unwrap_grid_records(resp.json())
-    index = {}
+    index = {"by_po": {}, "records": records}
 
     for record in records:
         for field in POGRID_PO_FIELDS:
@@ -383,40 +366,66 @@ def preload_pogrid(page, headers):
                 continue
             key = normalize_invoice_key(record.get(field))
             if key:
-                index.setdefault(key, []).append((record, field))
+                index["by_po"].setdefault(key, []).append((record, field))
 
     print(f"  PO records loaded     : {len(records)}")
-    print(f"  Local PO lookup keys  : {len(index)}")
+    print(f"  Local PO lookup keys  : {len(index['by_po'])}")
     return index
 
 
-def lookup_po_status_from_bulk(po_id, pogrid_index):
-    """Returns broad PO status from the PO grid, or ''. """
-    matches = pogrid_index.get(normalize_invoice_key(po_id), [])
-    if not matches:
-        return ""
-    record, _ = matches[0]
-    status = _first_text_field(record, POGRID_STATUS_FIELDS)
-    return f"PO: {status}" if status else ""
+def _description_contains_invoice(description, invoice):
+    """Match an invoice as a complete description token, ignoring case."""
+    invoice_text = str(invoice or "").strip()
+    if invoice_text.endswith(".0"):
+        invoice_text = invoice_text[:-2]
+    if not invoice_text:
+        return False
+    pattern = rf"(?<![A-Za-z0-9]){re.escape(invoice_text)}(?![A-Za-z0-9])"
+    return re.search(pattern, str(description or ""), flags=re.IGNORECASE) is not None
 
 
-def format_ir_bulk_status(status):
-    status = str(status or "").strip()
-    if not status:
-        return ""
-    return status if status.startswith("IR:") else f"IR: {status}"
+def _lookup_po_from_description_records(invoice, records):
+    """
+    Return (po_id, matched_field, ambiguous_count) for an invoice appearing
+    in a PO description. A PO is returned only when the match is unambiguous.
+    """
+    matches = {}
+    for record in records:
+        for field in POGRID_DESCRIPTION_FIELDS:
+            if not _description_contains_invoice(record.get(field), invoice):
+                continue
+            po_id = _first_int_field(record, POGRID_PO_FIELDS)
+            if po_id is not None:
+                matches.setdefault(po_id, field)
+
+    if len(matches) != 1:
+        return None, None, len(matches)
+    po_id, matched_field = next(iter(matches.items()))
+    return po_id, matched_field, 0
 
 
-def should_use_detailed_ir_status(status_mode, need_ch, need_chd):
-    if status_mode == "detailed":
-        return True
-    if status_mode == "hybrid":
-        return need_ch or need_chd
-    return False
+def lookup_po_from_description(invoice, pogrid_index):
+    """Search the locally preloaded PO descriptions."""
+    return _lookup_po_from_description_records(
+        invoice, pogrid_index.get("records", [])
+    )
 
 
-def should_use_detailed_po_status(status_mode):
-    return status_mode in ("detailed", "hybrid")
+def search_po_by_description(invoice, page, headers):
+    """Mirror the website PO search and verify the invoice in PODesc."""
+    search_year = datetime.now().year
+    resp = page.request.post(
+        POGRID_URL,
+        params={
+            "dateFrom": f"01/01/{search_year}",
+            "dateTo": f"12/31/{search_year}",
+            "search": str(invoice),
+        },
+        data=json.dumps({}),
+        headers=headers,
+    )
+    records = _unwrap_grid_records(resp.json())
+    return _lookup_po_from_description_records(invoice, records)
 
 
 def _unwrap_milestones(raw):
@@ -667,7 +676,7 @@ def get_col_map(ws):
     }
 
 
-def sync_sheet(ws, sheet_name, page, auth_headers, status_mode, irgrid_index, pogrid_index,
+def sync_sheet(ws, sheet_name, page, auth_headers, irgrid_index, pogrid_index,
                ir_cache, cheque_cache, po_status_cache):
     """
     Process one worksheet. Fills P2P Status only when the column exists,
@@ -690,11 +699,15 @@ def sync_sheet(ws, sheet_name, page, auth_headers, status_mode, irgrid_index, po
         print(f"  '{H_INVOICE}' column not found — skipping sheet.")
         return {"filled_po": 0, "filled_ir": 0, "filled_cheque": 0,
                 "status_updated": 0, "not_found": 0, "bulk_hits": 0,
-                "fallback_lookups": 0, "cheque_issued_skipped": 0}
+                "fallback_lookups": 0, "description_searches": 0,
+                "description_matches": 0,
+                "ambiguous_description_matches": 0, "cheque_issued_skipped": 0}
 
     stats = {"filled_po": 0, "filled_ir": 0, "filled_cheque": 0,
              "status_updated": 0, "not_found": 0, "bulk_hits": 0,
-             "fallback_lookups": 0, "cheque_issued_skipped": 0}
+             "fallback_lookups": 0, "description_searches": 0,
+             "description_matches": 0,
+             "ambiguous_description_matches": 0, "cheque_issued_skipped": 0}
 
     for row_idx in range(2, ws.max_row + 1):
         invoice_val = ws.cell(row=row_idx, column=col_invoice).value
@@ -745,6 +758,36 @@ def sync_sheet(ws, sheet_name, page, auth_headers, status_mode, irgrid_index, po
             if lookup_source.startswith("bulk:"):
                 stats["bulk_hits"] += 1
 
+            if (ir_id is None and po_id is None
+                    and not lookup_source.startswith("description:")):
+                po_id, description_field, ambiguous_count = lookup_po_from_description(
+                    invoice, pogrid_index
+                )
+                if po_id is None and not ambiguous_count:
+                    stats["description_searches"] += 1
+                    try:
+                        po_id, description_field, ambiguous_count = search_po_by_description(
+                            invoice, page, auth_headers
+                        )
+                        time.sleep(0.3)
+                    except Exception as e:
+                        print(f"{label}  PO description search error: {e}")
+
+                if po_id is not None:
+                    lookup_source = f"PO description:{description_field}"
+                    stats["description_matches"] += 1
+                elif ambiguous_count:
+                    stats["ambiguous_description_matches"] += 1
+                    print(
+                        f"{label}  ambiguous PO description match "
+                        f"({ambiguous_count} POs)"
+                    )
+                    lookup_source = "description:ambiguous"
+                else:
+                    lookup_source = "description:not-found"
+
+                ir_cache[cache_key] = (ir_id, po_id, lookup_source, bulk_status)
+
             if ir_id is None and po_id is None:
                 if lookup_source == "fallback":
                     print("not found in P2P")
@@ -778,11 +821,7 @@ def sync_sheet(ws, sheet_name, page, auth_headers, status_mode, irgrid_index, po
                     print(f"{label}  {', '.join(parts)}  ({lookup_source})")
 
         # ── Step 2: Milestone lookup — IR path (preferred) ──────────
-        need_ir_milestone = (
-            should_use_detailed_ir_status(status_mode, need_ch, need_chd)
-            or (need_ch and col_ch_num)
-            or (need_chd and col_ch_date)
-        )
+        need_ir_milestone = True
 
         if current_ir_id and need_ir_milestone:
             if current_ir_id not in cheque_cache:
@@ -817,14 +856,7 @@ def sync_sheet(ws, sheet_name, page, auth_headers, status_mode, irgrid_index, po
             print(f"{label}  {status_str}")
 
         # ── Step 3: PO milestone path (no IR yet) ───────────────────
-        elif current_ir_id and col_status:
-            status_str = format_ir_bulk_status(locals().get("bulk_status", ""))
-            if status_str:
-                ws.cell(row=row_idx, column=col_status).value = status_str
-                stats["status_updated"] += 1
-                print(f"{label}  {status_str}  (bulk status)")
-
-        elif not current_ir_id and current_po_id and should_use_detailed_po_status(status_mode):
+        elif not current_ir_id and current_po_id:
             if current_po_id not in po_status_cache:
                 print(f"{label}  PO milestones ...", end="  ", flush=True)
                 try:
@@ -841,13 +873,6 @@ def sync_sheet(ws, sheet_name, page, auth_headers, status_mode, irgrid_index, po
                 stats["status_updated"] += 1
             print(f"{label}  {po_status}")
 
-        elif not current_ir_id and current_po_id and col_status:
-            po_status = lookup_po_status_from_bulk(current_po_id, pogrid_index)
-            if po_status:
-                ws.cell(row=row_idx, column=col_status).value = po_status
-                stats["status_updated"] += 1
-                print(f"{label}  {po_status}  (bulk status)")
-
     return stats
 
 # ---------------------------------------------------------------------------
@@ -856,7 +881,6 @@ def sync_sheet(ws, sheet_name, page, auth_headers, status_mode, irgrid_index, po
 
 def main():
     registry_path = get_registry_path()
-    status_mode = get_status_mode()
 
     if not registry_path.lower().endswith((".xlsx", ".xlsm")):
         print(f"Error: selected file is not an Excel workbook:\n  {registry_path}")
@@ -904,13 +928,16 @@ def main():
         cheque_cache    = {}   # ir_id        → (status_str, chk_num, chk_date)
         po_status_cache = {}   # po_id        → status_str
 
-        print(f"\nStatus mode: {status_mode}")
+        print("\nP2P status: detailed milestone lookup")
         irgrid_index = preload_irgrid(page, auth_headers)
-        pogrid_index = preload_pogrid(page, auth_headers) if status_mode == "fast" else {}
+        pogrid_index = preload_pogrid(page, auth_headers)
 
         total = {"filled_po": 0, "filled_ir": 0, "filled_cheque": 0,
                  "status_updated": 0, "not_found": 0, "bulk_hits": 0,
-                 "fallback_lookups": 0, "cheque_issued_skipped": 0}
+                 "fallback_lookups": 0, "description_searches": 0,
+                 "description_matches": 0,
+                 "ambiguous_description_matches": 0,
+                 "cheque_issued_skipped": 0}
 
         for sheet_name in wb.sheetnames:
             ws = wb[sheet_name]
@@ -919,7 +946,7 @@ def main():
             print(f"{'='*60}")
 
             stats = sync_sheet(ws, sheet_name, page, auth_headers,
-                               status_mode, irgrid_index, pogrid_index,
+                               irgrid_index, pogrid_index,
                                ir_cache, cheque_cache, po_status_cache)
 
             for k in total:
@@ -932,6 +959,9 @@ def main():
                   f"Cheque filled: {stats['filled_cheque']}  "
                   f"Cheque issued skipped: {stats['cheque_issued_skipped']}  "
                   f"Not in P2P: {stats['not_found']}  "
+                  f"PO description searches: {stats['description_searches']}  "
+                  f"PO description matches: {stats['description_matches']}  "
+                  f"Ambiguous descriptions: {stats['ambiguous_description_matches']}  "
                   f"Bulk hits: {stats['bulk_hits']}  "
                   f"Fallback searches: {stats['fallback_lookups']}")
 
@@ -949,6 +979,9 @@ def main():
     print(f"  Cheque filled   : {total['filled_cheque']}")
     print(f"  Cheque issued skipped: {total['cheque_issued_skipped']}")
     print(f"  Not in P2P yet  : {total['not_found']}")
+    print(f"  PO description searches: {total['description_searches']}")
+    print(f"  PO description matches: {total['description_matches']}")
+    print(f"  Ambiguous descriptions: {total['ambiguous_description_matches']}")
     print(f"  Bulk IRGrid hits: {total['bulk_hits']}")
     print(f"  Fallback searches: {total['fallback_lookups']}")
     print(f"\n  Backup saved    : {backup_path}")
