@@ -54,7 +54,7 @@ OUTPUT_DIR = os.path.join(BASE_DIR, "Output Excel File")
 def load_private_config():
     if not os.path.isfile(CONFIG_PATH):
         raise FileNotFoundError(
-            "Missing private config file: p2p_private_config.json. "
+            f"Missing private config file:\n  {CONFIG_PATH}\n\n"
             "Copy p2p_private_config.example.json, fill in your private values, "
             "and keep p2p_private_config.json out of public repos."
         )
@@ -62,7 +62,24 @@ def load_private_config():
         return json.load(config_file)
 
 
-PRIVATE_CONFIG = load_private_config()
+def wait_after_startup_error():
+    """Keep a double-clicked Windows executable open so the error is visible."""
+    if not getattr(sys, "frozen", False):
+        return
+    try:
+        input("\nPress Enter to close this window...")
+    except (EOFError, KeyboardInterrupt):
+        pass
+
+
+try:
+    PRIVATE_CONFIG = load_private_config()
+except (OSError, json.JSONDecodeError) as exc:
+    print("\nP2P Registry Sync could not start.")
+    print("-" * 44)
+    print(exc)
+    wait_after_startup_error()
+    raise SystemExit(1)
 
 if not os.path.isfile(DEFAULT_REGISTRY_PATH):
     for filename in os.listdir(BASE_DIR):
