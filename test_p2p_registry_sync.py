@@ -91,5 +91,44 @@ class PoDescriptionLookupTests(unittest.TestCase):
         self.assertEqual(kwargs["data"], "{}")
 
 
+class MilestoneOrderingTests(unittest.TestCase):
+    def test_preserves_timestamp_when_milestones_share_a_date(self):
+        milestones = [
+            {"Title": "PO Creation", "DtCompleted": "2026-07-23T09:00:00"},
+            {"Title": "Approved", "DtCompleted": "2026-07-23T15:30:00"},
+        ]
+
+        self.assertEqual(
+            sync._current_milestone(milestones, "DtCompleted"),
+            ("Approved", "23/7/2026"),
+        )
+
+    def test_po_118466_same_date_uses_completed_workflow_priority(self):
+        # Model an API response returned newest-first with date-only values
+        # and no sequence field. The old index tie-break selected PO Creation.
+        milestones = [
+            {"Title": "Approved", "DtCompleted": "2026-07-23"},
+            {"Title": "Workflow: Condo Manager", "DtCompleted": "2026-07-23"},
+            {"Title": "Workflow: Create PO", "DtCompleted": "2026-07-23"},
+            {"Title": "PO Creation", "DtCompleted": "2026-07-23"},
+        ]
+
+        self.assertEqual(
+            sync._current_milestone(milestones, "DtCompleted"),
+            ("Approved", "23/7/2026"),
+        )
+
+    def test_recognizes_alternate_sequence_field(self):
+        milestones = [
+            {"Title": "PO Creation", "DtCompleted": "2026-07-23", "Sequence": 1},
+            {"Title": "Approved", "DtCompleted": "2026-07-23", "Sequence": 4},
+        ]
+
+        self.assertEqual(
+            sync._current_milestone(milestones, "DtCompleted"),
+            ("Approved", "23/7/2026"),
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

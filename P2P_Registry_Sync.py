@@ -457,15 +457,30 @@ def _unwrap_milestones(raw):
     return []
 
 
-def _format_milestone_date(date_str):
-    """Convert 'YYYY-MM-DDTHH:MM:SS' to 'D/M/YYYY'. Returns '' on failure."""
-    if not date_str or date_str in ("None", ""):
-        return ""
+def _parse_date_value(raw_date):
+    """Parse a Yardi date while preserving its time for milestone ordering."""
+    if not raw_date or str(raw_date) in ("None", ""):
+        return datetime.min
+    date_text = str(raw_date).strip()
     try:
-        dt = datetime.strptime(date_str.split("T")[0], "%Y-%m-%d")
-        return f"{dt.day}/{dt.month}/{dt.year}"
+        parsed = datetime.fromisoformat(date_text.replace("Z", "+00:00"))
     except ValueError:
-        return ""
+        try:
+            parsed = datetime.strptime(date_text, "%Y-%m-%d")
+        except ValueError:
+            return datetime.min
+
+    if parsed.tzinfo is not None:
+        # Preserve Yardi's displayed local date/time while making values
+        # consistently comparable with timestamps that have no offset.
+        parsed = parsed.replace(tzinfo=None)
+    return parsed
+
+
+def _format_milestone_date(date_str):
+    """Convert a Yardi date/time to D/M/YYYY. Returns '' on failure."""
+    dt = _parse_date_value(date_str)
+    return "" if dt == datetime.min else f"{dt.day}/{dt.month}/{dt.year}"
 
 
 def _parse_milestone_date(milestone, preferred_date_field):
@@ -473,13 +488,9 @@ def _parse_milestone_date(milestone, preferred_date_field):
         field for field in MILESTONE_DATE_FIELDS if field != preferred_date_field
     )
     for field in fields:
-        raw_date = milestone.get(field, "")
-        if not raw_date or str(raw_date) in ("None", ""):
-            continue
-        try:
-            return datetime.strptime(str(raw_date).split("T")[0], "%Y-%m-%d")
-        except ValueError:
-            continue
+        parsed = _parse_date_value(milestone.get(field, ""))
+        if parsed != datetime.min:
+            return parsed
     return datetime.min
 
 
@@ -488,14 +499,7 @@ def _is_truthy_api_flag(value):
 
 
 def _has_parseable_date(milestone, field):
-    raw_date = milestone.get(field, "")
-    if not raw_date or str(raw_date) in ("None", ""):
-        return False
-    try:
-        datetime.strptime(str(raw_date).split("T")[0], "%Y-%m-%d")
-        return True
-    except ValueError:
-        return False
+    return _parse_date_value(milestone.get(field, "")) != datetime.min
 
 
 def _is_completed(milestone, date_field=None):
@@ -528,14 +532,45 @@ def _looks_current(milestone):
 
 
 def _seq_value(milestone):
-    try:
-        return int(float(milestone.get("Seq", 0) or 0))
-    except (ValueError, TypeError):
-        return 0
+    sequence_fields = (
+        "Seq", "Sequence", "SequenceNo", "SeqNo", "StepSequence",
+        "Order", "SortOrder", "StepOrder",
+    )
+    for field in sequence_fields:
+        try:
+            value = milestone.get(field)
+            if value not in (None, ""):
+                return float(value)
+        except (ValueError, TypeError):
+            continue
+    return 0.0
+
+
+def _completed_title_priority(milestone):
+    """Provide a deterministic tie-breaker for common terminal workflow steps."""
+    title = _milestone_title(milestone).strip().lower()
+    if title == "paid" or "cheque" in title:
+        return 500
+    if "approved" in title or title == "approve":
+        return 400
+    if "completed" in title or "closed" in title:
+        return 300
+    if "invoice created" in title:
+        return 200
+    if "create po" in title:
+        return 100
+    if "po creation" in title:
+        return 50
+    return 0
 
 
 def _milestone_sort_key(milestone, preferred_date_field, index=0):
-    return (_parse_milestone_date(milestone, preferred_date_field), _seq_value(milestone), index)
+    return (
+        _parse_milestone_date(milestone, preferred_date_field),
+        _seq_value(milestone),
+        _completed_title_priority(milestone),
+        -index,
+    )
 
 
 def _latest_milestone(milestones, preferred_date_field):
@@ -548,7 +583,11 @@ def _latest_milestone(milestones, preferred_date_field):
 def _next_milestone(milestones, preferred_date_field):
     return min(
         enumerate(milestones),
-        key=lambda item: _milestone_sort_key(item[1], preferred_date_field, item[0]),
+        key=lambda item: (
+            _parse_milestone_date(item[1], preferred_date_field),
+            _seq_value(item[1]),
+            item[0],
+        ),
     )[1]
 
 
