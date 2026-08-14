@@ -46,7 +46,13 @@ def get_base_dir():
 
 BASE_DIR      = get_base_dir()
 CONFIG_PATH   = os.path.join(BASE_DIR, "p2p_private_config.json")
-SESSION_DIR   = os.path.join(BASE_DIR, "browser_session")
+LOCAL_APP_DATA = os.environ.get(
+    "LOCALAPPDATA",
+    os.path.join(os.path.expanduser("~"), "AppData", "Local"),
+)
+APP_DATA_DIR  = os.path.join(LOCAL_APP_DATA, "P2P_Registry_Sync")
+SESSION_DIR   = os.path.join(APP_DATA_DIR, "browser_session")
+AUTH_STATE_PATH = os.path.join(APP_DATA_DIR, "auth_state.json")
 DEFAULT_REGISTRY_PATH = os.path.join(BASE_DIR, "01. Cheque Registry_Year 2026.xlsx")
 OUTPUT_DIR = os.path.join(BASE_DIR, "Output Excel File")
 
@@ -163,6 +169,46 @@ def backup_existing_workbook(registry_path):
 # ---------------------------------------------------------------------------
 # Auth helpers
 # ---------------------------------------------------------------------------
+
+def restore_auth_state(context):
+    """Restore saved cookies, including Yardi's non-persistent JWT cookie."""
+    if not os.path.isfile(AUTH_STATE_PATH):
+        return False
+    try:
+        with open(AUTH_STATE_PATH, "r", encoding="utf-8") as state_file:
+            state = json.load(state_file)
+
+        allowed_cookie_fields = {
+            "name", "value", "url", "domain", "path", "expires",
+            "httpOnly", "secure", "sameSite", "partitionKey",
+        }
+        cookies = [
+            {
+                key: value
+                for key, value in cookie.items()
+                if key in allowed_cookie_fields
+            }
+            for cookie in state.get("cookies", [])
+        ]
+        if not cookies:
+            return False
+        context.add_cookies(cookies)
+        return True
+    except (OSError, json.JSONDecodeError, TypeError, ValueError) as exc:
+        print(f"Could not restore saved login state: {exc}")
+        return False
+
+
+def save_auth_state(context):
+    """Save cookies and local storage for reuse on the next run."""
+    try:
+        os.makedirs(APP_DATA_DIR, exist_ok=True)
+        context.storage_state(path=AUTH_STATE_PATH)
+        return True
+    except OSError as exc:
+        print(f"Could not save login state: {exc}")
+        return False
+
 
 def get_auth_headers(context):
     all_cookies = {c["name"]: c["value"] for c in context.cookies()}
@@ -662,16 +708,27 @@ def lookup_ir_milestone(ir_id, page, headers):
     if not milestones:
         return "No milestones", None, None
 
-    title, date = _current_milestone(milestones, "RevisedDate")
-    status_str  = _format_status(title, date, prefix="IR: ")
+    # A completed Paid milestone is terminal.  Yardi can leave an earlier
+    # milestone (for example Posted) flagged as current even after payment,
+    # so do not let that stale flag override the issued-cheque status.
+    paid_milestones = [
+        m for m in milestones
+        if _milestone_title(m).strip().lower() == "paid"
+        and _is_completed(m, "RevisedDate")
+    ]
+    paid = (
+        _latest_milestone(paid_milestones, "RevisedDate")
+        if paid_milestones else None
+    )
+
+    if paid:
+        title = _milestone_title(paid)
+        date = _milestone_date(paid, "RevisedDate")
+    else:
+        title, date = _current_milestone(milestones, "RevisedDate")
+    status_str = _format_status(title, date, prefix="IR: ")
 
     # Also extract cheque data from the Paid milestone if present
-    paid = next(
-        (m for m in milestones
-         if str(m.get("Title", "")).strip().lower() == "paid"
-         and _is_completed(m, "RevisedDate")),
-        None,
-    )
     check_num  = None
     check_date = None
     if paid:
@@ -721,6 +778,12 @@ def is_cheque_issued(ch_num, ch_date, status):
         return True
     status_text = str(status or "").strip().lower()
     return "cheque has issued" in status_text or status_text.startswith("ir: paid")
+
+
+def issued_cheque_status(ch_date):
+    """Build the terminal IR status from an existing registry cheque date."""
+    formatted_date = _format_milestone_date(str(ch_date))
+    return _format_status("Paid", formatted_date, prefix="IR: ")
 
 
 def get_col_map(ws):
@@ -779,6 +842,16 @@ def sync_sheet(ws, sheet_name, page, auth_headers, irgrid_index, pogrid_index,
         ch_val  = ws.cell(row=row_idx, column=col_ch_num).value if col_ch_num else None
         chd_val = ws.cell(row=row_idx, column=col_ch_date).value if col_ch_date else None
         status_val = ws.cell(row=row_idx, column=col_status).value if col_status else None
+
+        # Existing cheque data is authoritative even if an earlier run wrote a
+        # stale milestone such as "IR: Posted". Normalize it before skipping.
+        if not is_empty(ch_val) and not is_empty(chd_val):
+            final_status = issued_cheque_status(chd_val)
+            if col_status and status_val != final_status:
+                ws.cell(row=row_idx, column=col_status).value = final_status
+                stats["status_updated"] += 1
+            stats["cheque_issued_skipped"] += 1
+            continue
 
         if is_cheque_issued(ch_val, chd_val, status_val):
             stats["cheque_issued_skipped"] += 1
@@ -970,9 +1043,14 @@ def main():
                 ignore_https_errors=True,
             )
 
+        if restore_auth_state(context):
+            print(f"Restored saved login state from: {AUTH_STATE_PATH}")
+
         page = context.new_page()
         print("Checking session...")
         auth_headers = ensure_authenticated(page, context)
+        if save_auth_state(context):
+            print(f"Saved login state to: {AUTH_STATE_PATH}")
 
         try:
             page.evaluate("() => { window.moveTo(-10000, 0); }")

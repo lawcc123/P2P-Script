@@ -1,4 +1,7 @@
 import unittest
+import json
+import os
+import tempfile
 from unittest.mock import patch
 
 import P2P_Registry_Sync as sync
@@ -128,6 +131,100 @@ class MilestoneOrderingTests(unittest.TestCase):
             sync._current_milestone(milestones, "DtCompleted"),
             ("Approved", "23/7/2026"),
         )
+
+    def test_completed_paid_overrides_stale_current_posted_for_ir(self):
+        milestones = [
+            {
+                "Title": "Posted",
+                "RevisedDate": "2026-08-04",
+                "IsCurrent": True,
+            },
+            {
+                "Title": "Paid",
+                "RevisedDate": "2026-08-04",
+                "IsComplete": True,
+                "CheckNum": "7590",
+            },
+        ]
+
+        class Response:
+            @staticmethod
+            def json():
+                return milestones
+
+        class Request:
+            @staticmethod
+            def post(*args, **kwargs):
+                return Response()
+
+        class Page:
+            request = Request()
+
+        self.assertEqual(
+            sync.lookup_ir_milestone(145011, Page(), {}),
+            ("IR: Cheque has issued on 4/8/2026", "7590", "4/8/2026"),
+        )
+
+    def test_existing_cheque_date_produces_terminal_status(self):
+        self.assertEqual(
+            sync.issued_cheque_status("2026-08-04 00:00:00"),
+            "IR: Cheque has issued on 4/8/2026",
+        )
+
+
+class AuthenticationStateTests(unittest.TestCase):
+    def test_restores_session_cookie_from_saved_state(self):
+        state = {
+            "cookies": [{
+                "name": ".JWTAUTH",
+                "value": "header.payload.signature",
+                "domain": "example.test",
+                "path": "/",
+                "expires": -1,
+                "httpOnly": True,
+                "secure": True,
+                "sameSite": "Lax",
+            }],
+            "origins": [],
+        }
+
+        class Context:
+            restored_cookies = None
+
+            def add_cookies(self, cookies):
+                self.restored_cookies = cookies
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            state_path = os.path.join(temp_dir, "auth_state.json")
+            with open(state_path, "w", encoding="utf-8") as state_file:
+                json.dump(state, state_file)
+
+            context = Context()
+            with patch.object(sync, "AUTH_STATE_PATH", state_path):
+                restored = sync.restore_auth_state(context)
+
+        self.assertTrue(restored)
+        self.assertEqual(context.restored_cookies[0]["name"], ".JWTAUTH")
+        self.assertEqual(context.restored_cookies[0]["expires"], -1)
+
+    def test_saves_state_to_stable_app_data_path(self):
+        class Context:
+            saved_path = None
+
+            def storage_state(self, path):
+                self.saved_path = path
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            state_path = os.path.join(temp_dir, "auth_state.json")
+            context = Context()
+            with (
+                patch.object(sync, "APP_DATA_DIR", temp_dir),
+                patch.object(sync, "AUTH_STATE_PATH", state_path),
+            ):
+                saved = sync.save_auth_state(context)
+
+        self.assertTrue(saved)
+        self.assertEqual(context.saved_path, state_path)
 
 
 if __name__ == "__main__":
